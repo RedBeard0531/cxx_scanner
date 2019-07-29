@@ -6,6 +6,8 @@ import parseutils
 import strformat
 import os
 import sets
+import posix_utils
+import posix
 
 type
   ElemKind = enum
@@ -28,6 +30,7 @@ type
       parent: Elem
     of IncludeElem:
       path: string
+      next_from: string
     of PushMacroElem, PopMacroElem:
       ppName: string
     of LineElem:
@@ -118,7 +121,7 @@ proc popIf(fss: var FileScanState) =
     discard
     discard fss.curSeq[].pop
 
-proc handleInclude(rest: string)
+proc handleInclude(rest: string, next_from="")
 proc skipPastWhitespaceAndComments(fss: var FileScanState)
 
 proc skipPastEndOfLine(fss: var FileScanState) =
@@ -186,6 +189,9 @@ proc handleDirective(fss: var FileScanState; directive, rest: string) =
 
   of "pragma": discard # TODO
 
+  of "include_next":
+    fss.curSeq[] &= Elem(kind:IncludeElem, path: rest, next_from: fss.path)
+    handleInclude(rest, fss.path)
   of "include":
     fss.curSeq[] &= Elem(kind:IncludeElem, path: rest)
     handleInclude(rest)
@@ -277,20 +283,34 @@ let quotePath = @[
   "."
 ] & searchPath
 
-proc findInclude(isQuote:bool, partial: string): string =
-  let search = if isQuote: quotePath else: searchPath
+proc findInclude(isQuote:bool, partial: string, next_from: string): string =
+  let
+    search = if isQuote: quotePath else: searchPath
+    checkNextFrom = next_from.len != 0
+    curStat = if checkNextFrom: next_from.stat else: Stat()
+
+  var foundCur = not checkNextFrom
   for prefix in search:
     let path = prefix / partial
     if path.fileExists:
+      if not foundCur:
+        let pathStat = path.stat
+        if pathStat.st_dev == curStat.st_dev and pathStat.st_ino == curStat.st_ino:
+          foundCur = true
+        #echo &"skipping {path} for include_next for {next_from}"
+        continue
+      if checkNextFrom:
+        #echo &"accepted {path} for include_next for {next_from}"
+        discard
       return path
-  echo &"can't find file for {partial}"
+  #echo &"can't find file for {partial} from {next_from}"
   return ""
 
 var
   filesQueued: HashSet[string]
   fileQueue = @[paramStr(1)]
 
-proc handleInclude(rest: string) =
+proc handleInclude(rest: string, next_from="") =
   var close: int
   case rest[0]:
   of '"': close = rest.find('"', start=1)
@@ -298,10 +318,22 @@ proc handleInclude(rest: string) =
   else:
     echo &"wtf include {rest}"
     return
-  let path = findInclude(rest[0] == '"', rest[1..<close])
+  let path = findInclude(rest[0] == '"', rest[1..<close], next_from)
   if path.len != 0 and not filesQueued.containsOrIncl(path):
     fileQueue &= path
 
+proc walk(e: Elem)
+proc walk(se: seq[Elem]) =
+  for e in se:
+    e.walk
+
+proc walk(e: Elem) =
+  case e.kind:
+  of IfChain:
+    for cond in e.conditionals:
+      echo cond.cond
+      cond.body[].walk
+  else: discard
 
 for _ in 1..1:
   filesQueued.clear()
@@ -315,5 +347,6 @@ for _ in 1..1:
     else:
       fss.parseLineWise
     #print fss.root
+    #walk fss.root
 
 

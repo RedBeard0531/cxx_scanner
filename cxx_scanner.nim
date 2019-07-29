@@ -10,6 +10,10 @@ import posix_utils
 import posix
 
 type
+  Cursor = object
+    text: string
+    pos: int
+
   ElemKind = enum
       IfChain
       IncludeElem
@@ -48,12 +52,20 @@ type
       isExport: bool
 
   FileScanState = object
+    cursor: Cursor
     path: string
-    text: string
-    pos: int
     root: seq[Elem]
     curSeq: ptr seq[Elem]
     curIf: Elem
+
+converter toCursor(fss: var FileScanState): var Cursor = fss.cursor
+proc text(fss: var FileScanState): var string = fss.cursor.text
+proc pos(fss: var FileScanState): var int = fss.cursor.pos
+
+proc `text=`(fss: var FileScanState, text: string) =
+  fss.cursor.text = text
+proc `pos=`(fss: var FileScanState, pos: int) =
+  fss.cursor.pos = pos
 
 proc print(elem: Elem, depth = 0)
 proc print(elems: seq[Elem], depth = 0) =
@@ -92,7 +104,7 @@ proc print(elem: Elem, depth = 0) =
 proc makeFileScanState(path: string): FileScanState =
   #result.root.new
   result.path = path
-  result.text = ""
+  result.cursor = Cursor(text: "", pos: 0)
   result.curSeq = addr result.root
 
 proc pushCond(fss: var FileScanState, cond: string) =
@@ -122,55 +134,55 @@ proc popIf(fss: var FileScanState) =
     discard fss.curSeq[].pop
 
 proc handleInclude(rest: string, next_from="")
-proc skipPastWhitespaceAndComments(fss: var FileScanState)
+proc skipPastWhitespaceAndComments(cursor: var Cursor)
 
-proc skipPastEndOfLine(fss: var FileScanState) =
-  while fss.pos < fss.text.len:
+proc skipPastEndOfLine(cursor: var Cursor) =
+  while cursor.pos < cursor.text.len:
     # position after next \n
-    fss.pos += fss.text.skipUntil('\n', start=fss.pos) + 1
-    case fss.text[fss.pos-2] # before the \n
+    cursor.pos += cursor.text.skipUntil('\n', start=cursor.pos) + 1
+    case cursor.text[cursor.pos-2] # before the \n
     of '\\': continue
     of '\r':
-      if fss.text[fss.pos-3] == '\\':
+      if cursor.text[cursor.pos-3] == '\\':
         continue
     else: discard
     return
 
-proc skipPastEndOfRawString(fss: var FileScanState) =
-  assert fss.text[fss.pos-2 ..< fss.pos] == "R\""
+proc skipPastEndOfRawString(cursor: var Cursor) =
+  assert cursor.text[cursor.pos-2 ..< cursor.pos] == "R\""
   # [lex.string] calls these d-char. I guess d is for delimiter?
   const dchars = AllChars - {' ', '(', ')', '\\', '\t', '\v', '\r', '\n'}
-  let dstart = fss.pos
-  fss.pos += fss.text.skipWhile(dchars, start=fss.pos)
-  assert fss.text[fss.pos] == '('
-  let strEnd = &"){fss.text[dstart..<fss.pos]}\""
-  fss.pos = fss.text.find(strEnd, start=fss.pos+1) + strEnd.len
-  #echo fss.text[dstart-2 ..< fss.pos]
+  let dstart = cursor.pos
+  cursor.pos += cursor.text.skipWhile(dchars, start=cursor.pos)
+  assert cursor.text[cursor.pos] == '('
+  let strEnd = &"){cursor.text[dstart..<cursor.pos]}\""
+  cursor.pos = cursor.text.find(strEnd, start=cursor.pos+1) + strEnd.len
+  #echo cursor.text[dstart-2 ..< cursor.pos]
 
 
-proc skipPastEndOfSimpleString(fss: var FileScanState) =
-  while fss.pos < fss.text.len:
+proc skipPastEndOfSimpleString(cursor: var Cursor) =
+  while cursor.pos < cursor.text.len:
     # position after next "
-    fss.pos += fss.text.skipUntil('"', start=fss.pos) + 1
-    if fss.text[fss.pos-2] == '\\': # before the "
+    cursor.pos += cursor.text.skipUntil('"', start=cursor.pos) + 1
+    if cursor.text[cursor.pos-2] == '\\': # before the "
       var count = 1
-      for i in countdown(fss.pos-3, 0):
-        if fss.text[i] == '\\':
+      for i in countdown(cursor.pos-3, 0):
+        if cursor.text[i] == '\\':
           count.inc
       if count mod 2 == 1: # an odd number of \ escapes the "
         continue
     return
 
-proc skipPastEndOfComment(fss: var FileScanState) =
+proc skipPastEndOfComment(cursor: var Cursor) =
   when false:
-    while fss.pos < fss.text.len:
+    while cursor.pos < cursor.text.len:
       # position after next / (which should be less likely than '*')
-      fss.pos += fss.text.skipUntil('/', start=fss.pos) + 1
-      if fss.text[fss.pos-3] == '*': # before the /
+      cursor.pos += cursor.text.skipUntil('/', start=cursor.pos) + 1
+      if cursor.text[cursor.pos-3] == '*': # before the /
         return
-      fss.pos += 1 # on / so can't be on end of */ sequence
+      cursor.pos += 1 # on / so can't be on end of */ sequence
   else:
-    fss.pos = fss.text.find("*/", start=fss.pos) + 2
+    cursor.pos = cursor.text.find("*/", start=cursor.pos) + 2
 
 
 proc handleDirective(fss: var FileScanState; directive, rest: string) =
@@ -224,19 +236,19 @@ proc handleHash(fss: var FileScanState) =
   #echo &"#{directive} {rest}"
   fss.handleDirective(directive, rest)
 
-proc skipPastWhitespaceAndComments(fss: var FileScanState) =
-  while fss.pos < fss.text.len:
-    let start = fss.pos
-    fss.pos += fss.text.skipWhile(Whitespace - {'\n'}, start=fss.pos)
-    if fss.text[fss.pos] == '/':
-      let next = fss.text[fss.pos+1]
+proc skipPastWhitespaceAndComments(cursor: var Cursor) =
+  while cursor.pos < cursor.text.len:
+    let start = cursor.pos
+    cursor.pos += cursor.text.skipWhile(Whitespace - {'\n'}, start=cursor.pos)
+    if cursor.text[cursor.pos] == '/':
+      let next = cursor.text[cursor.pos+1]
       if next == '/':
-        fss.skipPastEndOfLine
-        fss.pos.dec
+        cursor.skipPastEndOfLine
+        cursor.pos.dec
       elif next == '*':
-        fss.pos += 2 # skip /*
-        fss.skipPastEndOfComment
-    if fss.pos == start: return # done skipping
+        cursor.pos += 2 # skip /*
+        cursor.skipPastEndOfComment
+    if cursor.pos == start: return # done skipping
 
 proc scanTopLevel(fss: var FileScanState) =
   const intersting = {'/', '#', '"'}

@@ -1,4 +1,3 @@
-import patty
 import std/strutils
 import sequtils
 import strutils
@@ -8,6 +7,8 @@ import os
 import sets
 import posix_utils
 import posix
+import tables
+import wave
 
 type
   Cursor = object
@@ -41,8 +42,11 @@ type
       line: int
       lineFile: string
     of DefineElem:
-      name, arguments, value: string
+      name: string
+      arguments: seq[string]
+      value: string
       isUndef: bool
+      isFunc: bool
     of ErrorElem:
       message: string
     of ImportElem:
@@ -57,6 +61,9 @@ type
     root: seq[Elem]
     curSeq: ptr seq[Elem]
     curIf: Elem
+  EvalState = object
+    defines: Table[string, Elem #[DefineElem]# ]
+    
 
 converter toCursor(fss: var FileScanState): var Cursor = fss.cursor
 proc text(fss: var FileScanState): var string = fss.cursor.text
@@ -66,6 +73,17 @@ proc `text=`(fss: var FileScanState, text: string) =
   fss.cursor.text = text
 proc `pos=`(fss: var FileScanState, pos: int) =
   fss.cursor.pos = pos
+
+func more(c: Cursor): bool = c.pos < c.text.high
+func `[]`(c: Cursor, offset: int): char =
+  let i = offset + c.pos
+  if i < 0 or i > c.text.high: return '\0'
+  return c.text[i]
+  
+func cur(c: Cursor): char = c.text[c.pos]
+func next(c: Cursor): char = c[1]
+func prev(c: Cursor): char = c[-1]
+func `$`(c: Cursor): string = c.text & '\n' & " ".repeat(c.pos) & '^'
 
 proc print(elem: Elem, depth = 0)
 proc print(elems: seq[Elem], depth = 0) =
@@ -92,8 +110,10 @@ proc print(elem: Elem, depth = 0) =
   of DefineElem:
     if elem.isUndef:
       echo &"{prefix}#undef {elem.name}"
+    elif elem.isFunc:
+      echo &"{prefix}#define {elem.name}({elem.arguments.join(\", \")}) {elem.value}"
     else:
-      echo &"{prefix}#define {elem.name}{elem.arguments} {elem.value}"
+      echo &"{prefix}#define {elem.name} {elem.value}"
   of ErrorElem:
     echo &"{prefix}#error {elem.message}"
   of ImportElem:
@@ -133,7 +153,7 @@ proc popIf(fss: var FileScanState) =
     discard
     discard fss.curSeq[].pop
 
-proc handleInclude(rest: string, next_from="")
+proc handleInclude(state: var EvalState, rest: string, next_from="")
 proc skipPastWhitespaceAndComments(cursor: var Cursor)
 
 proc skipPastEndOfLine(cursor: var Cursor) =
@@ -184,6 +204,74 @@ proc skipPastEndOfComment(cursor: var Cursor) =
   else:
     cursor.pos = cursor.text.find("*/", start=cursor.pos) + 2
 
+proc filterCommentsToEndOfLine(c: var Cursor): string =
+  var lastStart = c.pos
+  const intersting = {'/', '"', '\n'}
+  c.pos += c.text.skipUntil(intersting, start=c.pos)
+  while c.pos < c.text.len:
+    let start = c.pos
+    if c.cur == '/':
+      if c.next == '/' or c.next == '*':
+        result &= c.text[lastStart..<c.pos]
+        c.skipPastWhitespaceAndComments
+        result &= ' '
+        lastStart = c.pos
+      else:
+        c.pos += 1
+    elif c.cur == '"':
+      c.pos += 1
+      if c[-2] == 'R':
+        c.skipPastEndOfRawString
+      elif c[-2] != '\'': # '"' doesn't open a string!
+        c.skipPastEndOfSimpleString
+    else:
+      assert c.cur == '\n'
+      case c.text[c.pos-1] # before the \n
+      of '\\':
+        result &= c.text[lastStart..<c.pos-1]
+        c.pos.inc
+        lastStart = c.pos
+      of '\r':
+        if c.text[c.pos-2] == '\\':
+          result &= c.text[lastStart..<c.pos-2]
+          c.pos.inc
+          lastStart = c.pos
+      else:
+        break
+    c.pos += c.text.skipUntil(intersting, start=c.pos)
+  result &= c.text[lastStart..<min(c.pos, c.text.len)]
+
+proc parseDefine(directive: string): Elem =
+  var cursor = Cursor(text:directive)
+  cursor.skipPastWhitespaceAndComments()
+  let name = cursor.text.parseIdent(start=cursor.pos)
+  assert name.len > 0
+  cursor.pos += name.len
+  # no whitespace skipping here!
+  if cursor.pos == cursor.text.len or cursor.cur != '(':
+    return Elem(kind: DefineElem, name: name, value: cursor.text[cursor.pos..^1])
+  cursor.pos.inc
+  cursor.skipPastWhitespaceAndComments()
+  var args: seq[string] = @[]
+  if cursor.cur == ')':
+    cursor.pos.inc
+  else:
+    while true:
+      cursor.skipPastWhitespaceAndComments()
+      var arg = cursor.text.parseIdent(start=cursor.pos)
+      if arg.len == 0:
+        assert cursor.text[cursor.pos..cursor.pos+2] == "..."
+        arg = "..."
+      else:
+        assert arg.len > 0
+      cursor.pos += arg.len
+      cursor.skipPastWhitespaceAndComments()
+      cursor.pos.inc
+      args &= arg
+      if cursor.text[cursor.pos-1] == ')': break
+      assert cursor.text[cursor.pos-1] == ','
+  return Elem(kind: DefineElem, name: name, isFunc: true, arguments: args,
+              value: cursor.text[cursor.pos..^1])
 
 proc handleDirective(fss: var FileScanState; directive, rest: string) =
   case directive:
@@ -196,17 +284,17 @@ proc handleDirective(fss: var FileScanState; directive, rest: string) =
 
   of "warning": discard # meh
   of "error": fss.curSeq[] &= Elem(kind:ErrorElem, message: rest)
-  of "define": fss.curSeq[] &= Elem(kind:DefineElem, name: rest) # TODO args and such
+  of "define": fss.curSeq[] &= parseDefine(rest)
   of "undef": fss.curSeq[] &= Elem(kind:DefineElem, name: rest, isUndef: true)
 
   of "pragma": discard # TODO
 
   of "include_next":
     fss.curSeq[] &= Elem(kind:IncludeElem, path: rest, next_from: fss.path)
-    handleInclude(rest, fss.path)
+    #handleInclude(rest, fss.path)
   of "include":
     fss.curSeq[] &= Elem(kind:IncludeElem, path: rest)
-    handleInclude(rest)
+    #handleInclude(rest)
   else:
     echo &"unknown directive #{directive} {rest}"
     discard
@@ -226,12 +314,12 @@ proc handleHash(fss: var FileScanState) =
 
   fss.skipPastWhitespaceAndComments()
   if fss.text[fss.pos] == '\n':
-    return # some boost headers have invalid (but accepted) empty directives
+    return
   let directive = fss.text.parseIdent(start=fss.pos)
   fss.pos += directive.len
+  fss.skipPastWhitespaceAndComments()
   let restStart = fss.pos
-  fss.skipPastEndOfLine()
-  let rest = fss.text[restStart..<fss.pos].strip.multiReplace(("\\\r\n",""), ("\\\n", ""))
+  let rest = fss.cursor.filterCommentsToEndOfLine()
   #print fss.root
   #echo &"#{directive} {rest}"
   fss.handleDirective(directive, rest)
@@ -240,6 +328,7 @@ proc skipPastWhitespaceAndComments(cursor: var Cursor) =
   while cursor.pos < cursor.text.len:
     let start = cursor.pos
     cursor.pos += cursor.text.skipWhile(Whitespace - {'\n'}, start=cursor.pos)
+    if cursor.pos == cursor.text.len: return
     if cursor.text[cursor.pos] == '/':
       let next = cursor.text[cursor.pos+1]
       if next == '/':
@@ -277,6 +366,7 @@ proc scanTopLevel(fss: var FileScanState) =
 
 
 proc parseByteWise(fss: var FileScanState) =
+  echo &"\nstarting on {fss.path}"
   fss.text = readFile(fss.path)
   fss.scanTopLevel
 
@@ -319,10 +409,95 @@ proc findInclude(isQuote:bool, partial: string, next_from: string): string =
   return ""
 
 var
+  files: Table[string, seq[Elem]]
   filesQueued: HashSet[string]
   fileQueue = @[paramStr(1)]
 
-proc handleInclude(rest: string, next_from="") =
+proc expandDefined(state: EvalState, c: var Cursor): string =
+  c.skipPastWhitespaceAndComments()
+  let isParens = c.cur == '('
+  if isParens:
+    c.pos.inc
+    c.skipPastWhitespaceAndComments()
+  let ident = c.text.parseIdent(start=c.pos)
+  assert ident.len > 0
+  c.pos += ident.len
+  c.skipPastWhitespaceAndComments()
+  if isParens:
+    assert c.cur == ')'
+    c.pos.inc
+  #echo &"defined({ident}): {$(ident in state.defines)}"
+  return $(ident in state.defines)
+
+proc expand(state: EvalState, input: string): seq[string] =
+  var c = Cursor(text:input)
+  while c.more:
+    if c.cur in Whitespace or (c.cur == '/' and c.next in {'*', '/'}):
+      c.skipPastWhitespaceAndComments()
+      continue
+    
+    var tok = ""
+    case c.cur:
+    of IdentChars: # this also covers numbers
+      c.pos += c.text.parseWhile(tok, IdentChars, start=c.pos)
+      if tok == "defined":
+        result &= state.expandDefined(c)
+        continue
+      result &= tok
+      while result.len > 0 and result[^1] in state.defines:
+        let def = state.defines[result.pop]
+        if def.isFunc:
+          #TODO implement
+          result &= def.name
+          break
+        result &= state.expand(def.value)
+    of '{', '}', '[', ']', '(', ')', '?', ',', '~', '!':
+      result &= $c.cur
+      c.pos.inc
+    else:
+      c.pos.inc
+
+
+proc walk(state: var EvalState, e: Elem)
+proc walk(state: var EvalState, se: seq[Elem]) =
+  for e in se:
+    state.walk e
+
+proc getMacros(state: EvalState): seq[string] =
+  for name, elem in state.defines:
+    if elem.isUndef: continue
+    if elem.isFunc:
+      result &= &"{elem.name}({elem.arguments.join(\", \")})={elem.value}"
+    else:
+      result &= &"{elem.name}={elem.value}"
+
+proc walk(state: var EvalState, e: Elem) =
+  case e.kind:
+  of IfChain:
+    for cond in e.conditionals:
+      if state.getMacros.evalCPP(cond.cond):
+        state.walk cond.body[]
+      if false:
+        let expanded = state.expand cond.cond
+        if expanded.len == 1 and expanded[0] in ["0", "false"]:
+          continue
+        if expanded.len == 1 and (expanded[0] == "true" or expanded[0].allIt(it in Digits)):
+          state.walk cond.body[]
+          break
+        echo cond.cond
+        echo state.expand cond.cond
+        #state.walk cond.body[]
+  of DefineElem:
+    if e.isUndef:
+      state.defines.del e.name
+    else:
+      state.defines[e.name] = e
+  of IncludeElem:
+    state.handleInclude(e.path, e.next_from)
+    
+  else: discard
+
+proc handleInclude(state: var EvalState, rest: string, next_from="") =
   var close: int
   case rest[0]:
   of '"': close = rest.find('"', start=1)
@@ -331,34 +506,23 @@ proc handleInclude(rest: string, next_from="") =
     echo &"wtf include {rest}"
     return
   let path = findInclude(rest[0] == '"', rest[1..<close], next_from)
-  if path.len != 0 and not filesQueued.containsOrIncl(path):
-    fileQueue &= path
-
-proc walk(e: Elem)
-proc walk(se: seq[Elem]) =
-  for e in se:
-    e.walk
-
-proc walk(e: Elem) =
-  case e.kind:
-  of IfChain:
-    for cond in e.conditionals:
-      echo cond.cond
-      cond.body[].walk
-  else: discard
+  if path.len == 0: return
+  if path notin files:
+    var fss = makeFileScanState(path)
+    fss.parseByteWise
+    files[path] = fss.root
+  state.walk files[path]
 
 for _ in 1..1:
   filesQueued.clear()
   fileQueue = @[paramStr(1)]
   while fileQueue.len != 0:
     let file = fileQueue.pop
-    echo &"\nstarting on {file}"
     var fss = makeFileScanState(file)
     if true:
       fss.parseByteWise
     else:
       fss.parseLineWise
     #print fss.root
-    #walk fss.root
-
-
+    var evalState: EvalState
+    evalState.walk fss.root

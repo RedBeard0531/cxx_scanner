@@ -1,4 +1,3 @@
-import std/strutils
 import sequtils
 import strutils
 import parseutils
@@ -9,11 +8,11 @@ import posix_utils
 import posix
 import tables
 import wave
+import times
+
+import cursor
 
 type
-  Cursor = object
-    text: string
-    pos: int
 
   ElemKind = enum
       IfChain
@@ -63,27 +62,16 @@ type
     curIf: Elem
   EvalState = object
     defines: Table[string, Elem #[DefineElem]# ]
+    wave: Wave
     
-
 converter toCursor(fss: var FileScanState): var Cursor = fss.cursor
+
 proc text(fss: var FileScanState): var string = fss.cursor.text
 proc pos(fss: var FileScanState): var int = fss.cursor.pos
-
 proc `text=`(fss: var FileScanState, text: string) =
   fss.cursor.text = text
 proc `pos=`(fss: var FileScanState, pos: int) =
   fss.cursor.pos = pos
-
-func more(c: Cursor): bool = c.pos < c.text.high
-func `[]`(c: Cursor, offset: int): char =
-  let i = offset + c.pos
-  if i < 0 or i > c.text.high: return '\0'
-  return c.text[i]
-  
-func cur(c: Cursor): char = c.text[c.pos]
-func next(c: Cursor): char = c[1]
-func prev(c: Cursor): char = c[-1]
-func `$`(c: Cursor): string = c.text & '\n' & " ".repeat(c.pos) & '^'
 
 proc print(elem: Elem, depth = 0)
 proc print(elems: seq[Elem], depth = 0) =
@@ -154,92 +142,6 @@ proc popIf(fss: var FileScanState) =
     discard fss.curSeq[].pop
 
 proc handleInclude(state: var EvalState, rest: string, next_from="")
-proc skipPastWhitespaceAndComments(cursor: var Cursor)
-
-proc skipPastEndOfLine(cursor: var Cursor) =
-  while cursor.pos < cursor.text.len:
-    # position after next \n
-    cursor.pos += cursor.text.skipUntil('\n', start=cursor.pos) + 1
-    case cursor.text[cursor.pos-2] # before the \n
-    of '\\': continue
-    of '\r':
-      if cursor.text[cursor.pos-3] == '\\':
-        continue
-    else: discard
-    return
-
-proc skipPastEndOfRawString(cursor: var Cursor) =
-  assert cursor.text[cursor.pos-2 ..< cursor.pos] == "R\""
-  # [lex.string] calls these d-char. I guess d is for delimiter?
-  const dchars = AllChars - {' ', '(', ')', '\\', '\t', '\v', '\r', '\n'}
-  let dstart = cursor.pos
-  cursor.pos += cursor.text.skipWhile(dchars, start=cursor.pos)
-  assert cursor.text[cursor.pos] == '('
-  let strEnd = &"){cursor.text[dstart..<cursor.pos]}\""
-  cursor.pos = cursor.text.find(strEnd, start=cursor.pos+1) + strEnd.len
-  #echo cursor.text[dstart-2 ..< cursor.pos]
-
-
-proc skipPastEndOfSimpleString(cursor: var Cursor) =
-  while cursor.pos < cursor.text.len:
-    # position after next "
-    cursor.pos += cursor.text.skipUntil('"', start=cursor.pos) + 1
-    if cursor.text[cursor.pos-2] == '\\': # before the "
-      var count = 1
-      for i in countdown(cursor.pos-3, 0):
-        if cursor.text[i] == '\\':
-          count.inc
-      if count mod 2 == 1: # an odd number of \ escapes the "
-        continue
-    return
-
-proc skipPastEndOfComment(cursor: var Cursor) =
-  when false:
-    while cursor.pos < cursor.text.len:
-      # position after next / (which should be less likely than '*')
-      cursor.pos += cursor.text.skipUntil('/', start=cursor.pos) + 1
-      if cursor.text[cursor.pos-3] == '*': # before the /
-        return
-      cursor.pos += 1 # on / so can't be on end of */ sequence
-  else:
-    cursor.pos = cursor.text.find("*/", start=cursor.pos) + 2
-
-proc filterCommentsToEndOfLine(c: var Cursor): string =
-  var lastStart = c.pos
-  const intersting = {'/', '"', '\n'}
-  c.pos += c.text.skipUntil(intersting, start=c.pos)
-  while c.pos < c.text.len:
-    let start = c.pos
-    if c.cur == '/':
-      if c.next == '/' or c.next == '*':
-        result &= c.text[lastStart..<c.pos]
-        c.skipPastWhitespaceAndComments
-        result &= ' '
-        lastStart = c.pos
-      else:
-        c.pos += 1
-    elif c.cur == '"':
-      c.pos += 1
-      if c[-2] == 'R':
-        c.skipPastEndOfRawString
-      elif c[-2] != '\'': # '"' doesn't open a string!
-        c.skipPastEndOfSimpleString
-    else:
-      assert c.cur == '\n'
-      case c.text[c.pos-1] # before the \n
-      of '\\':
-        result &= c.text[lastStart..<c.pos-1]
-        c.pos.inc
-        lastStart = c.pos
-      of '\r':
-        if c.text[c.pos-2] == '\\':
-          result &= c.text[lastStart..<c.pos-2]
-          c.pos.inc
-          lastStart = c.pos
-      else:
-        break
-    c.pos += c.text.skipUntil(intersting, start=c.pos)
-  result &= c.text[lastStart..<min(c.pos, c.text.len)]
 
 proc parseDefine(directive: string): Elem =
   var cursor = Cursor(text:directive)
@@ -323,21 +225,6 @@ proc handleHash(fss: var FileScanState) =
   #print fss.root
   #echo &"#{directive} {rest}"
   fss.handleDirective(directive, rest)
-
-proc skipPastWhitespaceAndComments(cursor: var Cursor) =
-  while cursor.pos < cursor.text.len:
-    let start = cursor.pos
-    cursor.pos += cursor.text.skipWhile(Whitespace - {'\n'}, start=cursor.pos)
-    if cursor.pos == cursor.text.len: return
-    if cursor.text[cursor.pos] == '/':
-      let next = cursor.text[cursor.pos+1]
-      if next == '/':
-        cursor.skipPastEndOfLine
-        cursor.pos.dec
-      elif next == '*':
-        cursor.pos += 2 # skip /*
-        cursor.skipPastEndOfComment
-    if cursor.pos == start: return # done skipping
 
 proc scanTopLevel(fss: var FileScanState) =
   const intersting = {'/', '#', '"'}
@@ -463,20 +350,26 @@ proc walk(state: var EvalState, se: seq[Elem]) =
   for e in se:
     state.walk e
 
+proc macroToWave(elem: Elem): string =
+  assert not elem.isUndef
+  if elem.isFunc:
+    return &"{elem.name}({elem.arguments.join(\", \")})={elem.value}"
+  else:
+    return &"{elem.name}={elem.value}"
+
 proc getMacros(state: EvalState): seq[string] =
   for name, elem in state.defines:
     if elem.isUndef: continue
-    if elem.isFunc:
-      result &= &"{elem.name}({elem.arguments.join(\", \")})={elem.value}"
-    else:
-      result &= &"{elem.name}={elem.value}"
+    result &= elem.macroToWave
 
 proc walk(state: var EvalState, e: Elem) =
   case e.kind:
   of IfChain:
     for cond in e.conditionals:
-      if state.getMacros.evalCPP(cond.cond):
+      #if state.getMacros.evalCPP(cond.cond):
+      if state.wave.eval(cond.cond):
         state.walk cond.body[]
+        break
       if false:
         let expanded = state.expand cond.cond
         if expanded.len == 1 and expanded[0] in ["0", "false"]:
@@ -489,9 +382,11 @@ proc walk(state: var EvalState, e: Elem) =
         #state.walk cond.body[]
   of DefineElem:
     if e.isUndef:
-      state.defines.del e.name
+      #state.defines.del e.name
+      state.wave.undefMacro e.name
     else:
-      state.defines[e.name] = e
+      #state.defines[e.name] = e
+      state.wave.defineMacro e.macroToWave
   of IncludeElem:
     state.handleInclude(e.path, e.next_from)
     
@@ -524,5 +419,15 @@ for _ in 1..1:
     else:
       fss.parseLineWise
     #print fss.root
-    var evalState: EvalState
-    evalState.walk fss.root
+    block:
+      let start = getTime()
+      var evalState: EvalState
+      evalState.wave = makeWave()
+      evalState.walk fss.root
+      echo getTime() - start
+    let start = getTime()
+    for _ in 1..100:
+      var evalState: EvalState
+      evalState.wave = makeWave()
+      evalState.walk fss.root
+    echo (getTime() - start) div 100

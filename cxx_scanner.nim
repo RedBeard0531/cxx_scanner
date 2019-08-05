@@ -13,7 +13,6 @@ import times
 import cursor
 
 type
-
   ElemKind = enum
       IfChain
       IncludeElem
@@ -146,9 +145,7 @@ proc handleInclude(state: var EvalState, rest: string, next_from="")
 proc parseDefine(directive: string): Elem =
   var cursor = Cursor(text:directive)
   cursor.skipPastWhitespaceAndComments()
-  let name = cursor.text.parseIdent(start=cursor.pos)
-  assert name.len > 0
-  cursor.pos += name.len
+  let name = cursor.parseIdent()
   # no whitespace skipping here!
   if cursor.pos == cursor.text.len or cursor.cur != '(':
     return Elem(kind: DefineElem, name: name, value: cursor.text[cursor.pos..^1])
@@ -217,8 +214,7 @@ proc handleHash(fss: var FileScanState) =
   fss.skipPastWhitespaceAndComments()
   if fss.text[fss.pos] == '\n':
     return
-  let directive = fss.text.parseIdent(start=fss.pos)
-  fss.pos += directive.len
+  let directive = fss.cursor.parseIdent
   fss.skipPastWhitespaceAndComments()
   let restStart = fss.pos
   let rest = fss.cursor.filterCommentsToEndOfLine()
@@ -318,7 +314,7 @@ proc expandDefined(state: EvalState, c: var Cursor): string =
 
 proc expand(state: EvalState, input: string): seq[string] =
   var c = Cursor(text:input)
-  while c.more:
+  while c.notAtEnd:
     if c.cur in Whitespace or (c.cur == '/' and c.next in {'*', '/'}):
       c.skipPastWhitespaceAndComments()
       continue
@@ -385,6 +381,8 @@ proc walk(state: var EvalState, e: Elem) =
       #state.defines.del e.name
       state.wave.undefMacro e.name
     else:
+      var c = Cursor(text:e.value)
+      discard c.tokenize
       #state.defines[e.name] = e
       state.wave.defineMacro e.macroToWave
   of IncludeElem:

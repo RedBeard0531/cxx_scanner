@@ -1,6 +1,7 @@
 import strutils
 import parseutils
 import strformat
+import strtabs
 
 type
   Cursor* = object
@@ -20,6 +21,8 @@ func next*(c: Cursor): char = c[1]
 func prev*(c: Cursor): char = c[-1]
 func `$`*(c: Cursor): string = c.text & '\n' & " ".repeat(c.pos) & '^'
 func more*(c: Cursor): bool = c.pos < c.text.high
+func atEnd*(c: Cursor): bool = c.pos == c.text.len
+func notAtEnd*(c: Cursor): bool = not c.atEnd
 
 {.pop.}
 
@@ -56,8 +59,8 @@ proc skipPastEndOfSimpleString*(cursor: var Cursor) =
     if cursor.text[cursor.pos-2] == '\\': # before the "
       var count = 1
       for i in countdown(cursor.pos-3, 0):
-        if cursor.text[i] == '\\':
-          count.inc
+        if cursor.text[i] == '\\': count.inc
+        else: break
       if count mod 2 == 1: # an odd number of \ escapes the "
         continue
     return
@@ -125,3 +128,166 @@ proc skipPastWhitespaceAndComments*(cursor: var Cursor) =
         cursor.skipPastEndOfComment
     if cursor.pos == start: return # done skipping
 
+proc consumeOperator(c: var Cursor, opers: static seq[string]): string {.inline.} =
+  for op in opers:
+    assert c.cur == op[0]
+    case op.len:
+    of 3:
+      if c[1] == op[1] and c[2] == op[2]:
+        c.pos += 3
+        return op
+    of 2:
+      if c[1] == op[1]:
+        c.pos += 2
+        return op
+    of 1:
+      c.pos += 1
+      return op
+    else: assert op.len <= 3
+
+
+proc parseIdent*(c: var Cursor): string =
+  result = c.text.parseIdent(start=c.pos)
+  assert result.len > 0
+  c.pos += result.len
+
+let altTokens = {
+  "and": "&&",
+  "or": "||",
+  "xor": "^",
+  "not": "!",
+  "bitand": "&",
+  "bitor": "|",
+  "compl": "~",
+  "and_eq": "&=",
+  "or_eq": "|=",
+  "xor_eq": "^=",
+  "not_eq": "!=",
+}.newStringTable
+
+proc consumeNumber(c: var Cursor, base: static int): string =
+  var num = 0
+  c.pos -= 1
+  while c.more:
+    c.pos.inc
+    case c.cur:
+    of '\'': discard
+    of Digits:
+      num *= base
+      let part = c.cur.ord - '0'.ord
+      assert part < base
+      num += part
+    of 'a'..'f':
+      num *= base
+      let part = c.cur.ord - 'a'.ord
+      assert part < base
+      num += part
+    of 'A'..'F':
+      num *= base
+      let part = c.cur.ord - 'A'.ord
+      assert part < base
+      num += part
+    else: break
+  if not c.more: c.pos.inc
+  return $num
+
+proc tokenize*(c: var Cursor): seq[string] =
+  const encodingPrefix = ["u", "u8", "U", "L"]
+  const stringPrefix = ["R", "u", "u8", "U", "L"]
+  while c.notAtEnd:
+    assert c.cur != '\n'
+    assert c.cur != '/' or c.next notin {'/', '*'}
+    case c.cur:
+    of Whitespace:
+      c.skipPastWhitespaceAndComments()
+      result &= " "
+    of {'_', 'a'..'z', 'A'..'Z'}:
+      result &= c.parseIdent
+      if c[0] == '\'':
+        doAssert result[^1] in encodingPrefix
+        discard result.pop # ignore encodingPrefix
+      elif c[0] == '"':
+        doAssert result[^1] in stringPrefix
+        doAssert result[^1] != "R"
+        discard result.pop # ignore encodingPrefix
+      elif result[^1] in altTokens:
+        result[^1] = altTokens[result[^1]]
+    of Digits: #TODO? floating point like .123
+      if c.cur == '0' and c.next != '\0':
+        if c.next == 'x' or c.next == 'X':
+          c.pos += 2
+          result &= c.consumeNumber(16)
+          continue
+        elif c.next == 'o' or c.next == 'O':
+          c.pos += 2
+          result &= c.consumeNumber(8)
+          continue
+        elif c.next in '0'..'9':
+          c.pos += 1
+          result &= c.consumeNumber(8)
+          continue
+        elif c.next == 'b' or c.next == 'B':
+          c.pos += 2
+          result &= c.consumeNumber(2)
+          continue
+        else: assert c.next != '.'
+      result &= c.consumeNumber(10)
+    of '{', '}', '[', ']', '(', ')', '?', ',', '~', ';':
+      result &= $c.cur
+      c.pos.inc
+    # Not supporting alt tokens
+    of '!': result &= c.consumeOperator(@["!=", "!"])
+    of '#': result &= c.consumeOperator(@["##", "#"])
+    of '%': result &= c.consumeOperator(@["%=", "%"]) # %> %: %:%:
+    of '&': result &= c.consumeOperator(@["&&", "&=", "&"])
+    of '*': result &= c.consumeOperator(@["*=", "*"])
+    of '+': result &= c.consumeOperator(@["++", "+=", "+"])
+    of '-': result &= c.consumeOperator(@["->*", "--", "-=", "->", "-"])
+    of '/': result &= c.consumeOperator(@["/=", "/"])
+    of ':': result &= c.consumeOperator(@["::", ":"]) # :>
+    of '<': result &= c.consumeOperator(@["<<=", "<=>", "<=", "<<", "<"]) # <: <%
+    of '>': result &= c.consumeOperator(@[">>=", ">>", ">=", ">"])
+    of '=': result &= c.consumeOperator(@["==", "="])
+    of '^': result &= c.consumeOperator(@["^=", "^"])
+    of '|': result &= c.consumeOperator(@["|=", "||", "|"])
+    of '.':
+      doAssert c.next notin Digits # TODO characters
+      result &= c.consumeOperator(@["...", ".*", "."])
+
+    of '\'':
+      let start = c.pos
+      if c.next == '\\':
+        c.pos += 3 # skip escaped char
+        c.pos += c.text.skipUntil('\'', start=c.pos) + 1
+      else:
+        c.pos += 3
+      result &= c.text[start..<c.pos]
+    of '"':
+      var str = ""
+      while c.more:
+        c.pos.inc
+        case c.cur:
+        of '"': break
+        of '\\':
+          c.pos.inc
+          if c.cur == '\\': str &= '\\'
+          if c.cur == '"': str &= '"'
+          else:
+            echo c.next
+            assert false
+        else: str &= c.cur
+      c.pos.inc
+      result &= str
+    of {'\x80'..'\xFF'}:
+      doAssert false # TODO unicode?
+    of {'\0'..'\x20'} - Whitespace:
+      doAssert false # WTF control chars
+
+
+    of '@', '`', '$', '\\', '\x7f':
+      echo c
+      assert false
+
+when isMainModule:
+  var c = Cursor(text: " 0")
+  echo c.tokenize

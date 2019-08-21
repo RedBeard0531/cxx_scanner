@@ -147,9 +147,13 @@ proc consumeOperator(c: var Cursor, opers: static seq[string]): string {.inline.
 
 
 proc parseIdent*(c: var Cursor): string =
-  result = c.text.parseIdent(start=c.pos)
-  assert result.len > 0
+  result &= c.text.parseIdent(start=c.pos)
   c.pos += result.len
+  assert result.len > 0
+  while c[0] == '/' and c[1] == '\n':
+    c.pos += 2
+    result &= c.text.parseIdent(start=c.pos)
+    c.pos += result.len
 
 let altTokens = {
   "and": "&&",

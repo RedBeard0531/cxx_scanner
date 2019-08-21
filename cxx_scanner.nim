@@ -157,6 +157,7 @@ proc parseDefine(directive: string): Elem =
   else:
     while true:
       cursor.skipPastWhitespaceAndComments()
+      # TODO \newline support
       var arg = cursor.text.parseIdent(start=cursor.pos)
       if arg.len == 0:
         assert cursor.text[cursor.pos..cursor.pos+2] == "..."
@@ -302,9 +303,7 @@ proc expandDefined(state: EvalState, c: var Cursor): string =
   if isParens:
     c.pos.inc
     c.skipPastWhitespaceAndComments()
-  let ident = c.text.parseIdent(start=c.pos)
-  assert ident.len > 0
-  c.pos += ident.len
+  let ident = c.parseIdent
   c.skipPastWhitespaceAndComments()
   if isParens:
     assert c.cur == ')'

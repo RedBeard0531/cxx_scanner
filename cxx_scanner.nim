@@ -7,12 +7,21 @@ import sets
 import posix_utils
 import posix
 import tables
-import wave
 import times
+import lists
 
+import cxx_eval
 import cursor
 
+when not defined(release):
+  import wave
+  type CppStdExcept {.importcpp: "std::exception", header: "<exception>".} = object
+  proc what(s: CppStdExcept): cstring {.importcpp: "((char *)#.what())".}
+
+
 type
+  List[T] = DoublyLinkedList[T]
+
   ElemKind = enum
       IfChain
       IncludeElem
@@ -61,8 +70,10 @@ type
     curIf: Elem
   EvalState = object
     defines: Table[string, Elem #[DefineElem]# ]
-    wave: Wave
-    
+    masked: seq[string]
+    when not defined(release):
+      wave: Wave
+
 converter toCursor(fss: var FileScanState): var Cursor = fss.cursor
 
 proc text(fss: var FileScanState): var string = fss.cursor.text
@@ -71,6 +82,47 @@ proc `text=`(fss: var FileScanState, text: string) =
   fss.cursor.text = text
 proc `pos=`(fss: var FileScanState, pos: int) =
   fss.cursor.pos = pos
+
+proc spliceAfterInto[T](src: List[T], pos: DoublyLinkedNode[T], dst: var List[T]): DoublyLinkedNode[T] =
+  proc link(a, b: DoublyLinkedNode[T]) =
+    if a != nil: a.next = b
+    if b != nil: b.prev = a
+
+  if src.head == nil: return pos
+  if dst.head == nil:
+    dst = src
+    return src.tail
+  if pos == nil:
+    link src.tail, dst.head
+    dst.head = src.head
+    return src.tail
+
+  link src.tail, pos.next
+  link pos, src.head
+  if src.tail.next == nil:
+    dst.tail = src.tail
+  return src.tail
+
+proc replaceInto[T](src: List[T], a, b: DoublyLinkedNode[T], dst: var List[T]): DoublyLinkedNode[T] =
+  proc link(a, b: DoublyLinkedNode[T]) =
+    if a != nil: a.next = b
+    if b != nil: b.prev = a
+  let prev = a.prev
+  if prev == nil:
+    dst.head = b.next
+  else:
+    link prev, b.next
+  if b.next == nil:
+    dst.tail = prev
+
+  return src.spliceAfterInto(prev, dst)
+    
+proc toList[T](src: seq[T]): List[T] =
+  for x in src:
+    result.append(x)
+
+proc toList1[T](src: T): List[T] =
+  result.append(src)
 
 proc print(elem: Elem, depth = 0)
 proc print(elems: seq[Elem], depth = 0) =
@@ -148,6 +200,8 @@ proc parseDefine(directive: string): Elem =
   let name = cursor.parseIdent()
   # no whitespace skipping here!
   if cursor.pos == cursor.text.len or cursor.cur != '(':
+    cursor.skipPastWhitespaceAndComments()
+    if cursor[0] == '=': cursor.pos.dec
     return Elem(kind: DefineElem, name: name, value: cursor.text[cursor.pos..^1])
   cursor.pos.inc
   cursor.skipPastWhitespaceAndComments()
@@ -173,6 +227,7 @@ proc parseDefine(directive: string): Elem =
   return Elem(kind: DefineElem, name: name, isFunc: true, arguments: args,
               value: cursor.text[cursor.pos..^1])
 
+var pragmaOnceCount = 0
 proc handleDirective(fss: var FileScanState; directive, rest: string) =
   case directive:
   of "if": fss.pushIf rest
@@ -187,7 +242,11 @@ proc handleDirective(fss: var FileScanState; directive, rest: string) =
   of "define": fss.curSeq[] &= parseDefine(rest)
   of "undef": fss.curSeq[] &= Elem(kind:DefineElem, name: rest, isUndef: true)
 
-  of "pragma": discard # TODO
+  of "pragma":
+    if rest.strip != "once": return
+    let myId = &"__PRAG_ONCE_{pragmaOnceCount}"
+    fss.pushIf &"!defined({myId})"
+    fss.curSeq[] &= Elem(kind:DefineElem, name: myId)
 
   of "include_next":
     fss.curSeq[] &= Elem(kind:IncludeElem, path: rest, next_from: fss.path)
@@ -213,7 +272,7 @@ proc handleHash(fss: var FileScanState) =
       return
 
   fss.skipPastWhitespaceAndComments()
-  if fss.text[fss.pos] == '\n':
+  if fss.text[fss.pos] in {'\n', '0'..'9'}:
     return
   let directive = fss.cursor.parseIdent
   fss.skipPastWhitespaceAndComments()
@@ -249,16 +308,13 @@ proc scanTopLevel(fss: var FileScanState) =
 
 
 
-proc parseByteWise(fss: var FileScanState) =
+proc parseByteWise(fss: var FileScanState, isRoot = false) =
   echo &"\nstarting on {fss.path}"
   fss.text = readFile(fss.path)
+  const prelude = slurp("clang_prelude.h")
+  if isRoot: fss.text = prelude & fss.text
   fss.scanTopLevel
 
-proc parseLineWise(fss: var FileScanState) =
-  for line in readFile(fss.path).splitLines(keepEol=true).filterIt(it.len != 0 and it[0] == '#'):
-    let split = line[1..^1].strip().split(maxsplit=1)
-    fss.handleDirective(split[0], if split.len > 1: split[1] else: "")
-    
 let searchPath = @[
   "/usr/bin/../include/c++/v1",
   "/usr/local/include",
@@ -289,7 +345,7 @@ proc findInclude(isQuote:bool, partial: string, next_from: string): string =
         #echo &"accepted {path} for include_next for {next_from}"
         discard
       return path
-  #echo &"can't find file for {partial} from {next_from}"
+  echo &"can't find file for {partial} from {next_from}"
   return ""
 
 var
@@ -311,33 +367,162 @@ proc expandDefined(state: EvalState, c: var Cursor): string =
   #echo &"defined({ident}): {$(ident in state.defines)}"
   return $(ident in state.defines)
 
-proc expand(state: EvalState, input: string): seq[string] =
-  var c = Cursor(text:input)
-  while c.notAtEnd:
-    if c.cur in Whitespace or (c.cur == '/' and c.next in {'*', '/'}):
-      c.skipPastWhitespaceAndComments()
-      continue
-    
-    var tok = ""
-    case c.cur:
-    of IdentChars: # this also covers numbers
-      c.pos += c.text.parseWhile(tok, IdentChars, start=c.pos)
-      if tok == "defined":
-        result &= state.expandDefined(c)
-        continue
-      result &= tok
-      while result.len > 0 and result[^1] in state.defines:
-        let def = state.defines[result.pop]
-        if def.isFunc:
-          #TODO implement
-          result &= def.name
-          break
-        result &= state.expand(def.value)
-    of '{', '}', '[', ']', '(', ')', '?', ',', '~', '!':
-      result &= $c.cur
-      c.pos.inc
+proc expand(state: var EvalState, input: List[string], macroName = "",  args = Table[string, seq[string]]()): List[string]
+proc expand(state: var EvalState, input: seq[string], macroName = "",  args = Table[string, seq[string]]()): List[string] =
+  return state.expand(input.toList(), macroName=macroName,  args=args)
+proc expand(state: var EvalState, input: string, macroName = "",  args = Table[string, seq[string]]()): List[string] =
+  var c = Cursor(text: input)
+  return state.expand(c.tokenize, macroName=macroName, args=args)
+
+proc parseMacroArgs(cur: var DoublyLinkedNode[string], variadicLen: int): seq[seq[string]] =
+  while cur.value != ")":
+    if result.len != variadicLen:
+      result &= @[]
+    var nesting = 0
+    while nesting != 0 or cur.value notin [")", ","]:
+      if cur.value == "(": nesting.inc
+      elif nesting > 0 and cur.value == ")": nesting.dec
+      result[^1] &= cur.value
+      cur = cur.next
+      assert cur != nil
+      if cur == nil: return # XXX
+    if cur.value == ",":
+      cur = cur.next
+
+
+func nextSkipWS(node: DoublyLinkedNode[string]): DoublyLinkedNode[string] =
+  if node == nil: return nil
+  result = node.next
+  while result != nil:
+    if (result.value != " "): return
+    result = result.next
+func nextSkipWSStr(node: DoublyLinkedNode[string]): string =
+  let x = node.nextSkipWS
+  return if x == nil: "" else: x.value
+func prevSkipWS(node: DoublyLinkedNode[string]): DoublyLinkedNode[string] =
+  if node == nil: return nil
+  result = node.prev
+  while result != nil:
+    if (result.value != " "): return
+    result = result.prev
+func prevSkipWSStr(node: DoublyLinkedNode[string]): string =
+  let x = node.prevSkipWS
+  return if x == nil: "" else: x.value
+
+proc trimWS(input: List[string]): List[string] =
+  result = input
+  while result.head != nil and result.head.value == " ": result.remove(result.head)
+  while result.tail != nil and result.tail.value == " ": result.remove(result.tail)
+
+var callCount = 0
+proc expand(state: var EvalState, input: List[string], macroName = "", args = Table[string, seq[string]]()): List[string] =
+  let call = $callCount & "::   "
+  callCount.inc
+
+  result = input
+  var printing {.global.} = false
+  if printing: echo call, macroName, ' ', result
+  defer:
+    if printing:  echo call, result
+
+  let evaledArgs = toSeq(args.pairs).mapIt((it[0], state.expand(it[1]).trimWS.toSeq)).toTable
+  if printing: echo call, evaledArgs
+  var cur = input.head
+  if args.len != 0:
+    while cur != nil:
+      if cur.value == "__VA_ARGS__": assert cur.value in args
+      if cur.value in args:
+        let next = cur.nextSkipWSStr
+        let prev = cur.prevSkipWSStr
+        if next == "##" or prev == "##" or prev == "#":
+          # XXX for ## shouldn't join tokens.
+          if prev == "#":
+            cur.value = evaledArgs[cur.value].join().strip()
+            cur.value = &"\"{cur.value}\""
+            while true:
+              let stop = cur.prev.value == "#"
+              result.remove(cur.prev)
+              if stop: break
+          else:
+            cur.value = args[cur.value].filterIt(it.len != 0 and it != " ").join()
+        else:
+          let evaled = evaledArgs[cur.value]
+          if evaled.len == 0:
+            cur.value = ""
+          else:
+            cur = evaled.toList().replaceInto(cur, cur, result)
+      cur = cur.next
+  cur = input.head
+  while cur != nil:
+    if cur.value == "#":
+      echo "XXX: ",  result
+      assert cur.value != "#"
+    if cur.value == "##":
+      let next = cur.nextSkipWS
+      let prev = cur.prevSkipWS
+      cur.value = prev.value & next.value
+      cur = List[string](head: cur, tail: cur).replaceInto(prev, next, result)
+    cur = cur.next
+
+  if macroName.len != 0: state.masked &= macroName
+
+  cur = input.head
+  while cur != nil:
+    var didExpand = false
+    let mayBeFunc = cur.nextSkipWS != nil and cur.nextSkipWS.value == "("
+    if cur.value in state.defines and cur.value notin state.masked:
+      let def = state.defines[cur.value]
+      assert not def.isUndef
+      if not def.isFunc:
+        cur = state.expand(def.value, macroName=def.name).replaceInto(cur, cur, result)
+        didExpand = true
+      elif mayBeFunc:
+        let start = cur
+        let variadicLen =
+          if def.arguments.len != 0 and def.arguments[^1] == "...": def.arguments.len
+          else: -1
+        cur = cur.nextSkipWS.next
+        let rawArgs = cur.parseMacroArgs(variadicLen)
+        doAssert def.arguments.len == rawArgs.len
+
+        var callArgs: Table[string, seq[string]]
+        for i, name in def.arguments:
+          callArgs[if name == "...": "__VA_ARGS__" else: name] = rawArgs[i]
+        cur = state.expand(def.value, macroName=def.name, args=callArgs).replaceInto(start, cur, result)
+        didExpand = true
     else:
-      c.pos.inc
+      let start = cur
+      case cur.value:
+      of "defined":
+        var name: string
+        if mayBeFunc:
+          cur = cur.nextSkipWS.nextSkipWS
+          name = cur.value
+          cur = cur.nextSkipWS
+          doAssert cur.value == ")"
+        else:
+          cur = cur.nextSkipWS
+          name = cur.value
+        let res = if name in state.defines: "1" else: "0"
+        cur = res.toList1.replaceInto(start, cur, result)
+        didExpand = true
+      of "__has_feature":
+        if mayBeFunc:
+          cur = cur.nextSkipWS.nextSkipWS
+          let name = cur.value
+          cur = cur.nextSkipWS
+          doAssert cur.value == ")"
+          const features = ["XXX"] # TODO
+          let res = if name in features: "1" else: "0"
+          cur = res.toList1.replaceInto(start, cur, result)
+          didExpand = true
+    #echo cur.value
+    #assert cur.value.cstring[0] notin IdentStartChars or cur.value in ["true", "false"]
+    if not didExpand:
+      cur = cur.nextSkipWS
+  
+  if macroName.len != 0: discard state.masked.pop
+
 
 
 proc walk(state: var EvalState, e: Elem)
@@ -362,31 +547,53 @@ proc walk(state: var EvalState, e: Elem) =
   of IfChain:
     for cond in e.conditionals:
       #if state.getMacros.evalCPP(cond.cond):
-      if state.wave.eval(cond.cond):
+      if true:
+        #echo cond.cond
+        discard
+        discard state.expand(cond.cond)
+        #echo ""
+      var expanded = state.expand(cond.cond).toSeq.filterIt(it != " ")
+      expanded.shallow
+      let res = expanded.eval
+      when not defined(release):
+        try:
+          let waveRes = state.wave.eval(cond.cond)
+          if res != waveRes:
+            if "UCHAR_MAX" in state.defines:
+              echo state.defines["__SCHAR_MAX__"].value
+            echo cond.cond
+            echo expanded
+            echo res
+            echo waveRes
+            let ignore = [
+              "__STDC_VERSION__",
+              "__WAVE__",
+            ].anyIt(it in cond.cond)
+            assert ignore or res == waveRes
+        except CppStdExcept as e:
+          echo &"ignoring cpp exception: {e.what()}"
+      if res:
         state.walk cond.body[]
         break
-      if false:
-        let expanded = state.expand cond.cond
-        if expanded.len == 1 and expanded[0] in ["0", "false"]:
-          continue
-        if expanded.len == 1 and (expanded[0] == "true" or expanded[0].allIt(it in Digits)):
-          state.walk cond.body[]
-          break
-        echo cond.cond
-        echo state.expand cond.cond
-        #state.walk cond.body[]
   of DefineElem:
     if e.isUndef:
-      #state.defines.del e.name
-      state.wave.undefMacro e.name
+      state.defines.del e.name
+      when not defined(release): state.wave.undefMacro e.name
     else:
-      var c = Cursor(text:e.value)
-      discard c.tokenize
-      #state.defines[e.name] = e
-      state.wave.defineMacro e.macroToWave
+      when not defined(release):
+        if e.name in state.defines:
+          discard
+          state.wave.undefMacro e.name
+      state.defines[e.name] = e
+      when not defined(release):
+        if not (e.name[0] == '_' and e.name in [
+          "__STDC__",
+          "__STDC_HOSTED__",
+          "__cplusplus",
+          ]):
+          state.wave.defineMacro e.macroToWave
   of IncludeElem:
     state.handleInclude(e.path, e.next_from)
-    
   else: discard
 
 proc handleInclude(state: var EvalState, rest: string, next_from="") =
@@ -395,7 +602,10 @@ proc handleInclude(state: var EvalState, rest: string, next_from="") =
   of '"': close = rest.find('"', start=1)
   of '<': close = rest.find('>', start=1)
   else:
-    echo &"wtf include {rest}"
+    let expanded = state.expand(rest).toSeq.join().strip()
+    echo &"wtf include {rest} => {expanded}"
+    assert expanded[0] in {'<', '"'}
+    state.handleInclude(expanded, next_from)
     return
   let path = findInclude(rest[0] == '"', rest[1..<close], next_from)
   if path.len == 0: return
@@ -411,20 +621,21 @@ for _ in 1..1:
   while fileQueue.len != 0:
     let file = fileQueue.pop
     var fss = makeFileScanState(file)
-    if true:
-      fss.parseByteWise
-    else:
-      fss.parseLineWise
+    fss.parseByteWise(isRoot=true)
     #print fss.root
     block:
       let start = getTime()
       var evalState: EvalState
-      evalState.wave = makeWave()
+      when not defined(release):
+        evalState.wave = makeWave()
       evalState.walk fss.root
       echo getTime() - start
     let start = getTime()
-    for _ in 1..100:
+    if true: break
+    const rep = 100
+    for _ in 1..rep:
       var evalState: EvalState
-      evalState.wave = makeWave()
+      when not defined(release):
+        evalState.wave = makeWave()
       evalState.walk fss.root
-    echo (getTime() - start) div 100
+    echo (getTime() - start) div rep

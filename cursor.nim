@@ -1,28 +1,37 @@
 import strutils
 import parseutils
 import strformat
-import strtabs
 
 type
   Cursor* = object
     text*: string
     pos*: int
 
+  TokCursor* = object
+    text*: seq[string]
+    pos*: int
+
+  AnyCursor = Cursor | TokCursor
+
   
 {.push inline.}
 
-func `[]`*(c: Cursor, offset: int): char =
+func `[]`*(c: AnyCursor, offset: int): auto =
   let i = offset + c.pos
-  if i < 0 or i > c.text.high: return '\0'
+  if i < 0 or i > c.text.high:
+    when c is Cursor:
+      return '\0'
+    else:
+      return ""
   return c.text[i]
 
-func cur*(c: Cursor): char = c.text[c.pos]
-func next*(c: Cursor): char = c[1]
-func prev*(c: Cursor): char = c[-1]
+func cur*(c: AnyCursor): auto = c.text[c.pos]
+func next*(c: AnyCursor): auto = c[1]
+func prev*(c: AnyCursor): auto = c[-1]
 func `$`*(c: Cursor): string = c.text & '\n' & " ".repeat(c.pos) & '^'
-func more*(c: Cursor): bool = c.pos < c.text.high
-func atEnd*(c: Cursor): bool = c.pos == c.text.len
-func notAtEnd*(c: Cursor): bool = not c.atEnd
+func more*(c: AnyCursor): bool = c.pos < c.text.high
+func atEnd*(c: AnyCursor): bool = c.pos == c.text.len
+func notAtEnd*(c: AnyCursor): bool = not c.atEnd
 
 {.pop.}
 
@@ -155,45 +164,39 @@ proc parseIdent*(c: var Cursor): string =
     result &= c.text.parseIdent(start=c.pos)
     c.pos += result.len
 
-let altTokens = {
-  "and": "&&",
-  "or": "||",
-  "xor": "^",
-  "not": "!",
-  "bitand": "&",
-  "bitor": "|",
-  "compl": "~",
-  "and_eq": "&=",
-  "or_eq": "|=",
-  "xor_eq": "^=",
-  "not_eq": "!=",
-}.newStringTable
-
-proc consumeNumber(c: var Cursor, base: static int): string =
-  var num = 0
+proc consumeNumber(c: var Cursor, base: static uint): string =
+  var num = 0u64
   c.pos -= 1
-  while c.more:
-    c.pos.inc
-    case c.cur:
-    of '\'': discard
-    of Digits:
-      num *= base
-      let part = c.cur.ord - '0'.ord
-      assert part < base
-      num += part
-    of 'a'..'f':
-      num *= base
-      let part = c.cur.ord - 'a'.ord
-      assert part < base
-      num += part
-    of 'A'..'F':
-      num *= base
-      let part = c.cur.ord - 'A'.ord
-      assert part < base
-      num += part
-    else: break
-  if not c.more: c.pos.inc
-  return $num
+  try:
+    while true:
+      c.pos.inc
+      case c[0]:
+      of '\'': discard
+      of Digits:
+        num *= base
+        let part = c.cur.ord - '0'.ord
+        assert part < base
+        num += part.uint64
+      of 'a'..'f':
+        num *= base
+        let part = 10 + c.cur.ord - 'a'.ord
+        assert part < base
+        num += part.uint64
+      of 'A'..'F':
+        num *= base
+        let part = 10 + c.cur.ord - 'A'.ord
+        assert part < base
+        num += part.uint64
+      else:
+        result = $num
+        while c[0] in {'u', 'U', 'l', 'L'}:
+          if c.cur in {'u', 'U'}: result &= 'u'
+          c.pos.inc
+        return
+  except:
+    echo c
+    raise
+  assert false
 
 proc tokenize*(c: var Cursor): seq[string] =
   const encodingPrefix = ["u", "u8", "U", "L"]
@@ -214,8 +217,6 @@ proc tokenize*(c: var Cursor): seq[string] =
         doAssert result[^1] in stringPrefix
         doAssert result[^1] != "R"
         discard result.pop # ignore encodingPrefix
-      elif result[^1] in altTokens:
-        result[^1] = altTokens[result[^1]]
     of Digits: #TODO? floating point like .123
       if c.cur == '0' and c.next != '\0':
         if c.next == 'x' or c.next == 'X':
@@ -267,7 +268,7 @@ proc tokenize*(c: var Cursor): seq[string] =
         c.pos += 3
       result &= c.text[start..<c.pos]
     of '"':
-      var str = ""
+      var str = "\""
       while c.more:
         c.pos.inc
         case c.cur:
@@ -280,6 +281,7 @@ proc tokenize*(c: var Cursor): seq[string] =
             echo c.next
             assert false
         else: str &= c.cur
+      str &= '"'
       c.pos.inc
       result &= str
     of {'\x80'..'\xFF'}:
@@ -291,7 +293,8 @@ proc tokenize*(c: var Cursor): seq[string] =
     of '@', '`', '$', '\\', '\x7f':
       echo c
       assert false
+  #for s in result.mitems: s.shallow
 
 when isMainModule:
-  var c = Cursor(text: " 0")
+  var c = Cursor(text: "__GLIBC_PREREQ(2, 10)")
   echo c.tokenize

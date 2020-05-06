@@ -13,6 +13,7 @@ type
 
   AnyCursor = Cursor | TokCursor
 
+
   
 {.push inline.}
 
@@ -35,55 +36,67 @@ func notAtEnd*(c: AnyCursor): bool = not c.atEnd
 
 {.pop.}
 
-proc skipPastWhitespaceAndComments*(cursor: var Cursor)
+when false:
+  template assert(cond: typed): void =
+    if not cond:
+      echo c
+      system.assert cond
 
-proc skipPastEndOfLine*(cursor: var Cursor) =
-  while cursor.pos < cursor.text.len:
+  template doAssert(cond: typed): void =
+    if not cond:
+      echo c
+      system.doAssert cond
+
+
+proc skipPastWhitespaceAndComments*(c: var Cursor)
+
+proc skipPastEndOfLine*(c: var Cursor) =
+  while c.pos < c.text.len:
     # position after next \n
-    cursor.pos += cursor.text.skipUntil('\n', start=cursor.pos) + 1
-    case cursor.text[cursor.pos-2] # before the \n
+    c.pos += c.text.skipUntil('\n', start=c.pos) + 1
+    case c.text[c.pos-2] # before the \n
     of '\\': continue
     of '\r':
-      if cursor.text[cursor.pos-3] == '\\':
+      if c.text[c.pos-3] == '\\':
         continue
     else: discard
     return
 
-proc skipPastEndOfRawString*(cursor: var Cursor) =
-  assert cursor.text[cursor.pos-2 ..< cursor.pos] == "R\""
+proc skipPastEndOfRawString*(c: var Cursor) =
+  assert c.text[c.pos-2 ..< c.pos] == "R\""
   # [lex.string] calls these d-char. I guess d is for delimiter?
   const dchars = AllChars - {' ', '(', ')', '\\', '\t', '\v', '\r', '\n'}
-  let dstart = cursor.pos
-  cursor.pos += cursor.text.skipWhile(dchars, start=cursor.pos)
-  assert cursor.text[cursor.pos] == '('
-  let strEnd = &"){cursor.text[dstart..<cursor.pos]}\""
-  cursor.pos = cursor.text.find(strEnd, start=cursor.pos+1) + strEnd.len
-  #echo cursor.text[dstart-2 ..< cursor.pos]
+  let dstart = c.pos
+  c.pos += c.text.skipWhile(dchars, start=c.pos)
+  assert c.text[c.pos] == '('
+  let strEnd = &"){c.text[dstart..<c.pos]}\""
+  c.pos = c.text.find(strEnd, start=c.pos+1) + strEnd.len
+  #echo c.text[dstart-2 ..< c.pos]
 
 
-proc skipPastEndOfSimpleString*(cursor: var Cursor) =
-  while cursor.pos < cursor.text.len:
+proc skipPastEndOfSimpleString*(c: var Cursor) =
+  while c.pos < c.text.len:
     # position after next "
-    cursor.pos += cursor.text.skipUntil('"', start=cursor.pos) + 1
-    if cursor.text[cursor.pos-2] == '\\': # before the "
+    c.pos += c.text.skipUntil('"', start=c.pos) + 1
+    if c.text[c.pos-2] == '\\': # before the "
       var count = 1
-      for i in countdown(cursor.pos-3, 0):
-        if cursor.text[i] == '\\': count.inc
+      for i in countdown(c.pos-3, 0):
+        if c.text[i] == '\\': count.inc
         else: break
       if count mod 2 == 1: # an odd number of \ escapes the "
         continue
     return
 
-proc skipPastEndOfComment*(cursor: var Cursor) =
+proc skipPastEndOfComment*(c: var Cursor) =
   when false:
-    while cursor.pos < cursor.text.len:
+    while c.pos < c.text.len:
       # position after next / (which should be less likely than '*')
-      cursor.pos += cursor.text.skipUntil('/', start=cursor.pos) + 1
-      if cursor.text[cursor.pos-3] == '*': # before the /
+      c.pos += c.text.skipUntil('/', start=c.pos) + 1
+      if c.text[c.pos-3] == '*': # before the /
         return
-      cursor.pos += 1 # on / so can't be on end of */ sequence
+      c.pos += 1 # on / so can't be on end of */ sequence
   else:
-    cursor.pos = cursor.text.find("*/", start=cursor.pos) + 2
+    c.pos = c.text.find("*/", start=c.pos) + 2
 
 proc filterCommentsToEndOfLine*(c: var Cursor): string =
   var lastStart = c.pos
@@ -92,6 +105,7 @@ proc filterCommentsToEndOfLine*(c: var Cursor): string =
   while c.pos < c.text.len:
     let start = c.pos
     if c.cur == '/':
+      #TODO check for '/'
       if c.next == '/' or c.next == '*':
         result &= c.text[lastStart..<c.pos]
         c.skipPastWhitespaceAndComments
@@ -122,20 +136,20 @@ proc filterCommentsToEndOfLine*(c: var Cursor): string =
     c.pos += c.text.skipUntil(intersting, start=c.pos)
   result &= c.text[lastStart..<min(c.pos, c.text.len)]
 
-proc skipPastWhitespaceAndComments*(cursor: var Cursor) =
-  while cursor.pos < cursor.text.len:
-    let start = cursor.pos
-    cursor.pos += cursor.text.skipWhile(Whitespace - {'\n'}, start=cursor.pos)
-    if cursor.pos == cursor.text.len: return
-    if cursor.text[cursor.pos] == '/':
-      let next = cursor.text[cursor.pos+1]
+proc skipPastWhitespaceAndComments*(c: var Cursor) =
+  while c.pos < c.text.len:
+    let start = c.pos
+    c.pos += c.text.skipWhile(Whitespace - {'\n'}, start=c.pos)
+    if c.pos == c.text.len: return
+    if c.text[c.pos] == '/':
+      let next = c.text[c.pos+1]
       if next == '/':
-        cursor.skipPastEndOfLine
-        cursor.pos.dec
+        c.skipPastEndOfLine
+        c.pos.dec
       elif next == '*':
-        cursor.pos += 2 # skip /*
-        cursor.skipPastEndOfComment
-    if cursor.pos == start: return # done skipping
+        c.pos += 2 # skip /*
+        c.skipPastEndOfComment
+    if c.pos == start: return # done skipping
 
 proc consumeOperator(c: var Cursor, opers: static seq[string]): string {.inline.} =
   for op in opers:
@@ -165,12 +179,16 @@ proc parseIdent*(c: var Cursor): string =
     c.pos += result.len
 
 proc consumeNumber(c: var Cursor, base: static uint): string =
+  #TODO follow insane pp-number grammar.
   var num = 0u64
+  var isFloat = false
   c.pos -= 1
   try:
     while true:
       c.pos.inc
-      case c[0]:
+      if c.atEnd:
+        return $num
+      case c.cur:
       of '\'': discard
       of Digits:
         num *= base
@@ -178,15 +196,31 @@ proc consumeNumber(c: var Cursor, base: static uint): string =
         assert part < base
         num += part.uint64
       of 'a'..'f':
+        if base == 10 and c.cur == 'e':
+          isFloat = true
+          if c.next in {'+', '-'}: c.pos.inc
+          continue;
+        if c.cur == 'f' and isFloat: continue
         num *= base
         let part = 10 + c.cur.ord - 'a'.ord
         assert part < base
         num += part.uint64
       of 'A'..'F':
+        if base == 10 and c.cur == 'E':
+          isFloat = true
+          if c.next in {'+', '-'}: c.pos.inc
+          continue;
+        if c.cur == 'F' and isFloat: continue
         num *= base
         let part = 10 + c.cur.ord - 'A'.ord
         assert part < base
         num += part.uint64
+
+      # TODO floats
+      of '.':
+        isFloat = true
+        discard
+
       else:
         result = $num
         while c[0] in {'u', 'U', 'l', 'L'}:
@@ -235,7 +269,6 @@ proc tokenize*(c: var Cursor): seq[string] =
           c.pos += 2
           result &= c.consumeNumber(2)
           continue
-        else: assert c.next != '.'
       result &= c.consumeNumber(10)
     of '{', '}', '[', ']', '(', ')', '?', ',', '~', ';':
       result &= $c.cur
@@ -256,8 +289,10 @@ proc tokenize*(c: var Cursor): seq[string] =
     of '^': result &= c.consumeOperator(@["^=", "^"])
     of '|': result &= c.consumeOperator(@["|=", "||", "|"])
     of '.':
-      doAssert c.next notin Digits # TODO characters
-      result &= c.consumeOperator(@["...", ".*", "."])
+      if c.next in Digits: # TODO characters
+        result &= c.consumeNumber(10)
+      else:
+        result &= c.consumeOperator(@["...", ".*", "."])
 
     of '\'':
       let start = c.pos
@@ -293,8 +328,13 @@ proc tokenize*(c: var Cursor): seq[string] =
     of '@', '`', '$', '\\', '\x7f':
       echo c
       assert false
-  #for s in result.mitems: s.shallow
+  for s in result.mitems: s.shallow
+  result.shallow
+
+proc tokenize*(s: string): seq[string] =
+  var c = Cursor(text: s)
+  return c.tokenize
 
 when isMainModule:
-  var c = Cursor(text: "__GLIBC_PREREQ(2, 10)")
+  var c = Cursor(text: "__GLIBC_PREREQ (2, 10)")
   echo c.tokenize

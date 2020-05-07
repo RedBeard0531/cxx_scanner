@@ -4,11 +4,12 @@ import parseutils
 import strformat
 import os
 import sets
-import posix_utils
+#import posix_utils
 import posix
 import tables
 import times
 import lists
+from sugar import dump
 
 import cxx_eval
 import cursor
@@ -117,6 +118,19 @@ proc replaceInto[T](src: List[T], a, b: DoublyLinkedNode[T], dst: var List[T]): 
     dst.tail = prev
 
   return src.spliceAfterInto(prev, dst)
+
+proc replaceCurWith(c: var TokCursor, vals: openArray[string]) =
+  assert vals.len != 0
+  c.text[c.pos] = vals[0]
+  c.text.insert(vals[1..^1], c.pos)
+  c.pos += vals.len - 1
+
+proc replaceRangeWith*(c: var TokCursor, a, b: int, vals: openArray[string]) =
+  assert vals.len != 0
+  let removeLen = b - a + 1
+  assert removeLen > 0
+  c.text[(c.pos + a)..(c.pos + b)] = vals
+  c.pos += a + vals.len - 1
     
 proc toList[T](src: seq[T]): List[T] =
   for x in src:
@@ -161,7 +175,8 @@ proc print(elem: Elem, depth = 0) =
   of ModuleElem:
     echo &"{prefix}{elem.isExport} module {elem.moduleName}"
 
-proc makeFileScanState(path: string): FileScanState =
+proc makeFileScanState(path: string): ref FileScanState =
+  result.new
   #result.root.new
   result.path = path
   result.cursor = Cursor(text: "", pos: 0)
@@ -317,7 +332,9 @@ proc parseByteWise(fss: var FileScanState, isRoot = false) =
   echo &"\nstarting on {fss.path}"
   fss.text = readFile(fss.path)
   const prelude = slurp("clang_prelude.h")
-  if isRoot: fss.text = prelude & fss.text
+  if isRoot:
+    fss.text = prelude & fss.text
+    doAssert fss.curSeq == addr fss.root
   fss.scanTopLevel
 
 let searchPath = @[
@@ -378,122 +395,113 @@ proc expandDefined(state: EvalState, c: var Cursor): string =
   #echo &"defined({ident}): {$(ident in state.defines)}"
   return $(ident in state.defines)
 
-proc expand(state: var EvalState, input: List[string], macroName = "",  args = Table[string, seq[string]]()): List[string]
-proc expand(state: var EvalState, input: seq[string], macroName = "",  args = Table[string, seq[string]]()): List[string] =
-  return state.expand(input.toList(), macroName=macroName,  args=args)
-proc expand(state: var EvalState, input: string, macroName = "",  args = Table[string, seq[string]]()): List[string] =
+proc expand*(state: var EvalState, input: seq[string], macroName = "",  args = Table[string, seq[string]]()): seq[string]
+#proc expand(state: var EvalState, input: seq[string], macroName = "",  args = Table[string, seq[string]]()): List[string] =
+  #return state.expand(input.toList(), macroName=macroName,  args=args)
+proc expand*(state: var EvalState, input: string, macroName = "",  args = Table[string, seq[string]]()): seq[string] =
   var c = Cursor(text: input)
   return state.expand(c.tokenize, macroName=macroName, args=args)
 
-proc parseMacroArgs(cur: var DoublyLinkedNode[string], variadicLen: int): seq[seq[string]] =
-  while cur.value != ")":
+proc parseMacroArgs(c: var TokCursor, variadicLen: int): seq[seq[string]] =
+  while c.cur != ")":
     if result.len != variadicLen:
       result &= @[]
     var nesting = 0
-    while nesting != 0 or cur.value notin [")", ","]:
-      if cur.value == "(": nesting.inc
-      elif nesting > 0 and cur.value == ")": nesting.dec
-      result[^1] &= cur.value
-      cur = cur.next
-      assert cur != nil
-      if cur == nil: return # XXX
-    if cur.value == ",":
-      cur = cur.next
+    while nesting != 0 or c.cur notin [")", ","]:
+      if c.cur == "(": nesting.inc
+      elif nesting > 0 and c.cur == ")": nesting.dec
+      result[^1] &= c.cur
+      c.pos.inc
+      doAssert c.notAtEnd
+    if c.cur == ",":
+      c.pos.inc
 
+func nextSkipWS(c: TokCursor): int =
+  for i in countup(1, int.high):
+    if c[i] != " ":
+      return i
+func nextSkipWSStr(c: TokCursor): string =
+  c[c.nextSkipWS]
+func prevSkipWS(c: TokCursor): int =
+  for i in countdown(-1, int.low):
+    if c[i] != " ":
+      return i
+func prevSkipWSStr(c: TokCursor): string =
+  c[c.prevSkipWS]
 
-func nextSkipWS(node: DoublyLinkedNode[string]): DoublyLinkedNode[string] =
-  if node == nil: return nil
-  result = node.next
-  while result != nil:
-    if (result.value != " "): return
-    result = result.next
-func nextSkipWSStr(node: DoublyLinkedNode[string]): string =
-  let x = node.nextSkipWS
-  return if x == nil: "" else: x.value
-func prevSkipWS(node: DoublyLinkedNode[string]): DoublyLinkedNode[string] =
-  if node == nil: return nil
-  result = node.prev
-  while result != nil:
-    if (result.value != " "): return
-    result = result.prev
-func prevSkipWSStr(node: DoublyLinkedNode[string]): string =
-  let x = node.prevSkipWS
-  return if x == nil: "" else: x.value
-
-proc trimWS(input: List[string]): List[string] =
-  result = input
-  while result.head != nil and result.head.value == " ": result.remove(result.head)
-  while result.tail != nil and result.tail.value == " ": result.remove(result.tail)
+proc trimWS(input: seq[string]): seq[string] =
+  result = input.filterIt(it != " ")
+  #while result.head != nil and result.head.value == " ": result.remove(result.head)
+  #while result.tail != nil and result.tail.value == " ": result.remove(result.tail)
 
 var callCount = 0
-proc expand(state: var EvalState, input: List[string], macroName = "", args = Table[string, seq[string]]()): List[string] =
+proc expand*(state: var EvalState, input: seq[string], macroName = "", args = Table[string, seq[string]]()): seq[string] =
   const printing  = false
   let call = if printing: $callCount & "::   " else : ""
   callCount.inc
 
-  result = input
   if printing: echo call, macroName, ' ', result
   defer:
     if printing:  echo call, result
 
-  let evaledArgs = toSeq(args.pairs).mapIt((it[0], state.expand(it[1]).trimWS.toSeq)).toTable
+  let evaledArgs = toSeq(args.pairs).mapIt((it[0], state.expand(it[1]).trimWS)).toTable
   if printing: echo call, evaledArgs
-  var cur = input.head
+  var c = TokCursor(text:input, pos:0)
   if args.len != 0:
-    while cur != nil:
-      if cur.value == "__VA_ARGS__": assert cur.value in args
-      if cur.value in args:
-        let next = cur.nextSkipWSStr
-        let prev = cur.prevSkipWSStr
+    while c.more():
+      if c.cur == "__VA_ARGS__": assert c.cur in args
+      if c.cur in args:
+        let next = c.nextSkipWSStr
+        let prev = c.prevSkipWSStr
         if next == "##" or prev == "##" or prev == "#":
           # XXX for ## shouldn't join tokens.
           if prev == "#":
-            cur.value = evaledArgs[cur.value].join().strip()
-            cur.value = &"\"{cur.value}\""
+            c.text[c.pos] = '"' & evaledArgs[c.cur].join().strip() & '"'
             while true:
-              let stop = cur.prev.value == "#"
-              result.remove(cur.prev)
+              let stop = c.prev == "#"
+              c.text.delete(c.pos - 1)
+              c.pos.dec
               if stop: break
           else:
-            cur.value = args[cur.value].filterIt(it.len != 0 and it != " ").join()
+            c.text[c.pos] = args[c.cur].filterIt(it.len != 0 and it != " ").join()
         else:
-          let evaled = evaledArgs[cur.value]
+          let evaled = evaledArgs[c.cur]
           if evaled.len == 0:
-            cur.value = ""
+            c.text[c.pos] = ""
           else:
-            cur = evaled.toList().replaceInto(cur, cur, result)
-      cur = cur.next
-  cur = input.head
-  while cur != nil:
-    if cur.value == "#":
-      echo "XXX: ",  result
-      assert cur.value != "#"
-    if cur.value == "##":
-      let next = cur.nextSkipWS
-      let prev = cur.prevSkipWS
-      cur.value = prev.value & next.value
-      cur = List[string](head: cur, tail: cur).replaceInto(prev, next, result)
-    cur = cur.next
+            c.replaceCurWith(evaled)
+      c.pos.inc
+  c.pos = 0 # XXX was using input...
+  while c.more:
+    if c.cur == "#":
+      echo "XXX: ",  c
+      assert c.cur != "#"
+    if c.cur == "##":
+      let next = c.nextSkipWS
+      let prev = c.prevSkipWS
+      let val = c[prev] & c[next]
+      c.replaceRangeWith(prev, next, [val])
+    c.pos.inc
 
   if macroName.len != 0: state.masked &= macroName
 
-  cur = input.head
-  while cur != nil:
+  c.pos = 0 # XXX was using input...
+  while c.more:
     var didExpand = false
-    let mayBeFunc = cur.nextSkipWS != nil and cur.nextSkipWS.value == "("
-    if cur.value in state.defines and cur.value notin state.masked:
-      let def = state.defines[cur.value]
+    let mayBeFunc =  c.nextSkipWSStr == "("
+    if c.cur in state.defines and c.cur notin state.masked:
+      let def = state.defines[c.cur]
       assert not def.isUndef
       if not def.isFunc:
-        cur = state.expand(def.toks, macroName=def.name).replaceInto(cur, cur, result)
+        c.replaceCurWith(state.expand(def.toks, macroName=def.name))
         didExpand = true
       elif mayBeFunc:
-        let start = cur
+        let start = c.pos
         let variadicLen =
           if def.arguments.len != 0 and def.arguments[^1] == "...": def.arguments.len
           else: -1
-        cur = cur.nextSkipWS.next
-        let rawArgs = cur.parseMacroArgs(variadicLen)
+        c.pos += c.nextSkipWS + 1
+        let rawArgs = c.parseMacroArgs(variadicLen)
         doAssert def.arguments.len == rawArgs.len
 
         var callArgs: Table[string, seq[string]]
@@ -504,41 +512,42 @@ proc expand(state: var EvalState, input: List[string], macroName = "", args = Ta
         #echo def.value.tokenize
         #echo def.toks
         #assert def.toks == def.value.tokenize
-        cur = state.expand(def.toks, macroName=def.name, args=callArgs).replaceInto(start, cur, result)
+        c.replaceRangeWith(start - c.pos, 0, state.expand(def.toks, macroName=def.name, args=callArgs))
         didExpand = true
     else:
-      let start = cur
-      case cur.value:
+      let start = c.pos
+      case c.cur:
       of "defined":
+        c.pos += c.nextSkipWS # skip over "defined"
         var name: string
-        if mayBeFunc:
-          cur = cur.nextSkipWS.nextSkipWS
-          name = cur.value
-          cur = cur.nextSkipWS
-          doAssert cur.value == ")"
+        if mayBeFunc: # next nonWS is (
+          c.pos += c.nextSkipWS # skip over (
+          name = c.cur
+          c.pos += c.nextSkipWS # skip over name
+          doAssert c.cur == ")"
         else:
-          cur = cur.nextSkipWS
-          name = cur.value
+          name = c.cur
         let res = if name in state.defines: "1" else: "0"
-        cur = res.toList1.replaceInto(start, cur, result)
+        c.replaceRangeWith(start - c.pos, 0, [res])
         didExpand = true
       of "__has_feature":
         if mayBeFunc:
-          cur = cur.nextSkipWS.nextSkipWS
-          let name = cur.value
-          cur = cur.nextSkipWS
-          doAssert cur.value == ")"
+          c.pos += c.nextSkipWS # skip over "__has_feature"
+          c.pos += c.nextSkipWS # skip over (
+          let name = c.cur
+          c.pos += c.nextSkipWS # skip over name
+          doAssert c.cur == ")"
           const features = ["XXX"] # TODO
           let res = if name in features: "1" else: "0"
-          cur = res.toList1.replaceInto(start, cur, result)
+          c.replaceRangeWith(start - c.pos, 0, [res])
           didExpand = true
-    #echo cur.value
-    #assert cur.value.cstring[0] notin IdentStartChars or cur.value in ["true", "false"]
+    #echo c.cur
+    #assert c.cur.cstring[0] notin IdentStartChars or c.cur in ["true", "false"]
     if not didExpand:
-      cur = cur.nextSkipWS
+      c.pos += c.nextSkipWS
   
   if macroName.len != 0: discard state.masked.pop
-
+  return move(c.text)
 
 
 proc walk(state: var EvalState, e: Elem)
@@ -563,12 +572,8 @@ proc walk(state: var EvalState, e: Elem) =
   of IfChain:
     for cond in e.conditionals:
       #if state.getMacros.evalCPP(cond.cond):
-      if false:
-        #echo cond.cond
-        discard
-        discard state.expand(cond.cond)
         #echo ""
-      var expanded = state.expand(cond.toks).toSeq.filterIt(it != " ")
+      var expanded = state.expand(cond.toks).filterIt(it != " ")
       expanded.shallow
       let res = expanded.eval
       when false: #not defined(release):
@@ -627,7 +632,7 @@ proc handleInclude(state: var EvalState, rest: string, next_from="") =
   if path.len == 0: return
   if path notin files:
     var fss = makeFileScanState(path)
-    fss.parseByteWise
+    fss[].parseByteWise
     files[path] = fss.root
   state.walk files[path]
 
@@ -640,7 +645,7 @@ for _ in 1..10:
   while fileQueue.len != 0:
     let file = fileQueue.pop
     var fss = makeFileScanState(file)
-    fss.parseByteWise(isRoot=true)
+    fss[].parseByteWise(isRoot=true)
     #print fss.root
     block:
       let start = getTime()

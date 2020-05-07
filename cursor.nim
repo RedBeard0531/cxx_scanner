@@ -26,6 +26,7 @@ func `[]`*(c: AnyCursor, offset: int): auto =
       return ""
   return c.text[i]
 
+func setCur*(c: AnyCursor, val: auto) = c.text[c.pos] = val
 func cur*(c: AnyCursor): auto = c.text[c.pos]
 func next*(c: AnyCursor): auto = c[1]
 func prev*(c: AnyCursor): auto = c[-1]
@@ -33,6 +34,7 @@ func `$`*(c: Cursor): string = c.text & '\n' & " ".repeat(c.pos) & '^'
 func more*(c: AnyCursor): bool = c.pos < c.text.high
 func atEnd*(c: AnyCursor): bool = c.pos == c.text.len
 func notAtEnd*(c: AnyCursor): bool = not c.atEnd
+func contains*(c: AnyCursor, pos: int): bool = pos + c.pos in c.text
 
 {.pop.}
 
@@ -103,7 +105,7 @@ proc filterCommentsToEndOfLine*(c: var Cursor): string =
   const intersting = {'/', '"', '\n'}
   c.pos += c.text.skipUntil(intersting, start=c.pos)
   while c.pos < c.text.len:
-    let start = c.pos
+    #let start = c.pos
     if c.cur == '/':
       #TODO check for '/'
       if c.next == '/' or c.next == '*':
@@ -329,7 +331,7 @@ proc tokenize*(c: var Cursor): seq[string] =
       echo c
       assert false
   for s in result.mitems: s.shallow
-  result.shallow
+  #result.shallow
 
 proc tokenize*(s: string): seq[string] =
   var c = Cursor(text: s)

@@ -217,7 +217,7 @@ proc parseDefine(directive: string): Elem =
   cursor.skipPastWhitespaceAndComments()
   let name = cursor.parseIdent()
   # no whitespace skipping here!
-  if cursor.pos == cursor.text.len or cursor.cur != '(':
+  if cursor.atEnd or cursor.cur != '(':
     cursor.skipPastWhitespaceAndComments()
     if cursor[0] == '=': cursor.pos.dec
     var tc = Cursor(text: cursor.text[cursor.pos..^1])
@@ -340,7 +340,7 @@ proc parseByteWise(fss: var FileScanState, isRoot = false) =
 let searchPath = @[
   "/usr/bin/../include/c++/v1",
   "/usr/local/include",
-  "/usr/lib/clang/10.0.0/include",
+  "/usr/lib/clang/11.1.0/include",
   "/usr/include",
   "./src",
   "./build/prefix/include",
@@ -395,10 +395,10 @@ proc expandDefined(state: EvalState, c: var Cursor): string =
   #echo &"defined({ident}): {$(ident in state.defines)}"
   return $(ident in state.defines)
 
-proc expand*(state: var EvalState, input: seq[string], macroName = "",  args = Table[string, seq[string]]()): seq[string]
+proc expand*(state: var EvalState, input: sink seq[string], macroName = "",  args = Table[string, seq[string]]()): seq[string]
 #proc expand(state: var EvalState, input: seq[string], macroName = "",  args = Table[string, seq[string]]()): List[string] =
   #return state.expand(input.toList(), macroName=macroName,  args=args)
-proc expand*(state: var EvalState, input: string, macroName = "",  args = Table[string, seq[string]]()): seq[string] =
+proc expand*(state: var EvalState, input: sink string, macroName = "",  args = Table[string, seq[string]]()): seq[string] =
   var c = Cursor(text: input)
   return state.expand(c.tokenize, macroName=macroName, args=args)
 
@@ -435,7 +435,7 @@ proc trimWS(input: seq[string]): seq[string] =
   #while result.tail != nil and result.tail.value == " ": result.remove(result.tail)
 
 var callCount = 0
-proc expand*(state: var EvalState, input: seq[string], macroName = "", args = Table[string, seq[string]]()): seq[string] =
+proc expand*(state: var EvalState, input: sink seq[string], macroName = "", args = Table[string, seq[string]]()): seq[string] =
   const printing  = false
   let call = if printing: $callCount & "::   " else : ""
   callCount.inc
@@ -663,3 +663,5 @@ for _ in 1..10:
         evalState.wave = makeWave()
       evalState.walk fss.root
     echo (getTime() - start) div rep
+
+files.clear()
